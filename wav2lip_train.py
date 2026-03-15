@@ -64,7 +64,7 @@ class Dataset(object):
             if img is None:
                 return None
             try:
-                img = cv2.resize(img, (hparams.img_size, hparams.img_size))
+                img = cv2.resize(img, (192,288))
             except Exception as e:
                 return None
 

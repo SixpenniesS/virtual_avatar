@@ -9,6 +9,10 @@ from models import Wav2Lip
 import platform
 import time
 
+import tensorrt as trt
+import pycuda.driver as cuda
+import pycuda.autoinit
+
 parser = argparse.ArgumentParser(description='Inference code to lip-sync videos in the wild using Wav2Lip models')
 
 parser.add_argument('--checkpoint_path', type=str, 
@@ -31,7 +35,7 @@ parser.add_argument('--pads', nargs='+', type=int, default=[0, 10, 0, 0],
 
 parser.add_argument('--face_det_batch_size', type=int, 
 					help='Batch size for face detection', default=16)
-parser.add_argument('--wav2lip_batch_size', type=int, help='Batch size for Wav2Lip model(s)', default=128)
+parser.add_argument('--wav2lip_batch_size', type=int, help='Batch size for Wav2Lip model(s)', default=64)
 
 parser.add_argument('--resize_factor', default=1, type=int, 
 			help='Reduce the resolution by this factor. Sometimes, best results are obtained at 480p or 720p')
@@ -66,6 +70,7 @@ def get_smoothened_boxes(boxes, T):
 		boxes[i] = np.mean(window, axis=0)
 	return boxes
 
+# 调用人脸相关api
 def face_detect(images):
 	detector = face_detection.FaceAlignment(face_detection.LandmarksType._2D, 
 											flip_input=False, device=device)
@@ -158,28 +163,69 @@ mel_step_size = 16
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print('Using {} for inference.'.format(device))
 
-def _load(checkpoint_path):
-	if device == 'cuda':
-		checkpoint = torch.load(checkpoint_path)
-	else:
-		checkpoint = torch.load(checkpoint_path,
-								map_location=lambda storage, loc: storage)
-	return checkpoint
+# def _load(checkpoint_path):
+# 	if device == 'cuda':
+# 		checkpoint = torch.load(checkpoint_path)
+# 	else:
+# 		checkpoint = torch.load(checkpoint_path,
+# 								map_location=lambda storage, loc: storage)
+# 	return checkpoint
 
-def load_model(path):
-	model = Wav2Lip()
-	print("Load checkpoint from: {}".format(path))
-	checkpoint = _load(path)
-	s = checkpoint["state_dict"]
-	new_s = {}
-	for k, v in s.items():
-		new_s[k.replace('module.', '')] = v
-	model.load_state_dict(new_s)
+# def load_model(path):
+# 	model = Wav2Lip()
+# 	print("Load checkpoint from: {}".format(path))
+# 	checkpoint = _load(path)
+# 	s = checkpoint["state_dict"]
+# 	new_s = {}
+# 	for k, v in s.items():
+# 		new_s[k.replace('module.', '')] = v
+# 	model.load_state_dict(new_s)
 
-	model = model.to(device)
-	return model.eval()
+# 	model = model.to(device)
+# 	return model.eval()
+TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+def load_trt_engine(trt_engine_path):
+    with open(trt_engine_path, 'rb') as f, trt.Runtime(TRT_LOGGER) as runtime:
+        engine = runtime.deserialize_cuda_engine(f.read())
+    return engine
+
+# def get_engine_binding(engine, input_shape, output_shape):
+#     input_bindings = []
+#     output_bindings = []
+#     for binding in engine:
+#         size = trt.volume(engine.get_binding_shape(binding)) * engine.max_batch_size
+#         dtype = trt.nptype(engine.get_binding_dtype(binding))
+#         # 创建输入和输出的 device buffer
+#         buffer = cuda.mem_alloc(size * dtype.itemsize)
+#         if engine.binding_is_input(binding):
+#             input_bindings.append(int(buffer))
+#         else:
+#             output_bindings.append(int(buffer))
+    
+#     if len(input_bindings) != len(input_shape):
+#         raise ValueError("Expected {} input bindings, but found {}".format(len(input_shape), len(input_bindings)))
+#     if len(output_bindings) != len(output_shape):
+#         raise ValueError("Expected {} output bindings, but found {}".format(len(output_shape), len(output_bindings)))
+
+#     # 将每个输入/输出的 device buffer 和其对应的 shape 组合成一个元组
+#     input_bindings = [(buffer, shape) for buffer, shape in zip(input_bindings, input_shape)]
+#     output_bindings = [(buffer, shape) for buffer, shape in zip(output_bindings, output_shape)]
+#     return input_bindings + output_bindings
+# def get_binding(engine){
+# 	bindings = [None] * (len(engine) + len(outputs))
+# 	inputs = {}
+# 	for i in range(len(engine)):
+# 		inputs[engine[i].name] = cuda.mem_alloc(input_size)
+# 		bindings[i] = int(inputs[engine[i].name])
+# 	for i in range(len(outputs)):
+# 		outputs[i] = cuda.mem_alloc(output_size)
+# 		bindings[len(engine) + i] = int(outputs[i])
+
+# 	return bindings
+# }
 
 def main():
+
 	if not os.path.isfile(args.face):
 		raise ValueError('--face argument must be a valid path to video/image file')
 
@@ -246,39 +292,71 @@ def main():
 
 	batch_size = args.wav2lip_batch_size
 	gen = datagen(full_frames.copy(), mel_chunks)
+	
 
-	for i, (img_batch, mel_batch, frames, coords) in enumerate(tqdm(gen, 
-											total=int(np.ceil(float(len(mel_chunks))/batch_size)))):
-		time1=time.time()
-		if i == 0:
-			# print(img_batch)
-			model = load_model(args.checkpoint_path)
-			print ("Model loaded")
+	
+	for i, (img_batch, mel_batch, frames, coords) in enumerate(tqdm(gen,	
+										total=int(np.ceil(float(len(mel_chunks))/batch_size)))):
+		time1=time.time()	
+		if  i==0:
+			engine = load_trt_engine(args.checkpoint_path)
+			context = engine.create_execution_context()
+			print("engine loaded")
+			input_shape0= (batch_size, 1,80,16)   #声音
+			input_shape1 = (batch_size,6,96,96)  #图像
+			output_shape = (batch_size, 3,96,96)
+			stream = cuda.Stream()
+			# zeros0 = np.zeros(input_shape0, dtype=np.float32)
+			# zeros1 = np.zeros(input_shape1, dtype=np.float32)
+			# zeros_out = np.zeros(output_shape, dtype=np.float32)
+
+			d_input0 = cuda.mem_alloc(int(batch_size * trt.volume(input_shape0) * trt.float32.itemsize))
+			d_input1 = cuda.mem_alloc(int(batch_size * trt.volume(input_shape1) * trt.float32.itemsize))
+			d_output = cuda.mem_alloc(int(batch_size * trt.volume(output_shape) * trt.float32.itemsize))
 
 			frame_h, frame_w = full_frames[0].shape[:-1]
-			out = cv2.VideoWriter('temp/result.avi', 
-									cv2.VideoWriter_fourcc(*'DIVX'), fps, (frame_w, frame_h))
-		img_batch = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2))).to(device)
-		mel_batch = torch.FloatTensor(np.transpose(mel_batch, (0, 3, 1, 2))).to(device)
+			out = cv2.VideoWriter('temp/result.avi',
+							cv2.VideoWriter_fourcc(*'DIVX'), fps, (frame_w, frame_h))
+
+		# cuda.memcpy_htod(d_input0 , zeros0)
+		# cuda.memcpy_htod(d_input1, zeros1)
+		# cuda.memcpy_htod(d_output, zeros_out)
+
+		img_batch = np.ascontiguousarray(np.transpose(img_batch, (0, 3, 1, 2))).astype(np.float32)
+		mel_batch = np.ascontiguousarray(np.transpose(mel_batch, (0, 3, 1, 2))).astype(np.float32)
 		
-		with torch.no_grad():
-			pred = model(mel_batch, img_batch)
-		pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.
+		cuda.memcpy_htod_async(d_input0, mel_batch, stream)
+		
+		cuda.memcpy_htod_async(d_input1, img_batch, stream)
+		stream.synchronize	
+		context.execute_async_v2(bindings=[d_input0,d_input1,d_output], stream_handle=stream.handle)
+		stream.synchronize
+		pred = np.empty((batch_size,3,96,96), dtype=np.float32)
+
+		cuda.memcpy_dtoh_async(pred, d_output, stream)
+
+		stream.synchronize
+		pred = np.transpose(pred, (0, 2, 3, 1))*255.	
+	
 		time2=time.time()
 		der=(time2-time1)*1000
-		print("torch消耗时间为: {} ms".format(der))
+		print('fp32消耗时间为:{}ms'.format(der))
+		
 
+		# Post-process and write video frames
 		for p, f, c in zip(pred, frames, coords):
 			y1, y2, x1, x2 = c
 			p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
-			# print(p.shape)
 			f[y1:y2, x1:x2] = p
 			out.write(f)
-
 	out.release()
 
-	
 
+	# 清空内存
+	del context
+	del engine
+
+	
 	command = 'ffmpeg -y -i {} -i {} -strict -2 -q:v 1 {}'.format(args.audio, 'temp/result.avi', args.outfile)
 	subprocess.call(command, shell=platform.system() != 'Windows')
 
