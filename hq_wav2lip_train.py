@@ -66,7 +66,7 @@ class Dataset(object):
             if img is None:
                 return None
             try:
-                img = cv2.resize(img, (hparams.img_size, hparams.img_size))
+                img = cv2.resize(img, (192,288))
             except Exception as e:
                 return None
 
@@ -137,10 +137,15 @@ class Dataset(object):
                 continue
 
             try:
-                wavpath = join(vidname, "audio.wav")
-                wav = audio.load_wav(wavpath, hparams.sample_rate)
+                orig_mel_path = join(vidname, "audio.npy")
+                if True:
+                    orig_mel = np.load(orig_mel_path)
+                else:
+                    wavpath = join(vidname, "audio.wav")
+                    wav = audio.load_wav(wavpath, hparams.sample_rate)
 
-                orig_mel = audio.melspectrogram(wav).T
+                    orig_mel = audio.melspectrogram(wav).T
+                    np.save(orig_mel_path, orig_mel)
             except Exception as e:
                 continue
 

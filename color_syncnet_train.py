@@ -3,6 +3,7 @@ from tqdm import tqdm
 
 from models import SyncNet_color as SyncNet
 import audio
+from tensorboardX import SummaryWriter
 
 import torch
 from torch import nn
@@ -98,7 +99,7 @@ class Dataset(object):
                     all_read = False
                     break
                 try:
-                    img = cv2.resize(img, (hparams.img_size, hparams.img_size))
+                    img = cv2.resize(img, (192, 288))
                 except Exception as e:
                     all_read = False
                     break
@@ -108,10 +109,15 @@ class Dataset(object):
             if not all_read: continue
 
             try:
-                wavpath = join(vidname, "audio.wav")
-                wav = audio.load_wav(wavpath, hparams.sample_rate)
+                orig_mel_path = join(vidname, "audio.npy")
+                if os.path.isfile(orig_mel_path):
+                    orig_mel = np.load(orig_mel_path)
+                else:
+                    wavpath = join(vidname, "audio.wav")
+                    wav = audio.load_wav(wavpath, hparams.sample_rate)
 
-                orig_mel = audio.melspectrogram(wav).T
+                    orig_mel = audio.melspectrogram(wav).T
+                    np.save(orig_mel_path, orig_mel)
             except Exception as e:
                 continue
 
@@ -154,6 +160,9 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
             x = x.to(device)
 
             mel = mel.to(device)
+            if False:#生成网络模型
+                with SummaryWriter(comment='LeNet') as w:
+                    w.add_graph(model,(mel, x))
 
             a, v = model(mel, x)
             y = y.to(device)
@@ -175,6 +184,7 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
                     eval_model(test_data_loader, global_step, device, model, checkpoint_dir)
 
             prog_bar.set_description('Loss: {}'.format(running_loss / (step + 1)))
+            writer.add_scalar("train-1e-4", (running_loss / (step + 1)), global_step)
 
         global_epoch += 1
 
@@ -201,6 +211,7 @@ def eval_model(test_data_loader, global_step, device, model, checkpoint_dir):
             if step > eval_steps: break
 
         averaged_loss = sum(losses) / len(losses)
+        writer.add_scalar("val-1e-4", averaged_loss, global_step)
         print(averaged_loss)
 
         return
@@ -272,7 +283,7 @@ if __name__ == "__main__":
 
     if checkpoint_path is not None:
         load_checkpoint(checkpoint_path, model, optimizer, reset_optimizer=False)
-
+    writer = SummaryWriter("logs")
     train(device, model, train_data_loader, test_data_loader, optimizer,
           checkpoint_dir=checkpoint_dir,
           checkpoint_interval=hparams.syncnet_checkpoint_interval,
